@@ -1,0 +1,27 @@
+# --- Core Deep Learning & NLP ---
+torch==2.9.1
+torchaudio==2.9.1
+torchvision==0.24.1
+transformers==4.57.3
+peft==0.18.0
+accelerate==1.12.0
+datasets==2.16.0
+tokenizers==0.22.1
+safetensors==0.7.0
+
+# --- Alibaba Ecosystem (按需保留) ---
+# 如果你的代码里用到了 modelscope 下载模型，请保留下面这行
+modelscope==1.33.0
+
+# --- Data Science & Visualization ---
+numpy==2.2.6
+pandas==2.3.3
+scikit-learn==1.7.2
+matplotlib==3.10.8
+scipy==1.15.3
+tqdm==4.67.1
+pillow==12.1.0
+
+# --- Utils ---
+einops==0.8.1
+addict==2.4.0

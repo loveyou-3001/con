@@ -1,0 +1,36 @@
+name: hop_modern
+channels:
+  - defaults
+dependencies:
+  # 1. 核心运行环境：只指定 Python 版本，其他的让 Conda 自己解决
+  - python=3.10
+  - pip
+  - pip:
+    # --- 深度学习核心库 ---
+    - torch==2.9.1
+    - torchaudio==2.9.1
+    - torchvision==0.24.1
+    - transformers==4.57.3
+    - peft==0.18.0
+    - accelerate==1.12.0
+    - datasets==2.16.0
+    - tokenizers==0.22.1
+    - safetensors==0.7.0
+    
+    # --- 阿里生态 (按需保留) ---
+    - modelscope==1.33.0
+    
+    # --- 数据处理与科学计算 ---
+    - numpy==2.2.6
+    - pandas==2.3.3
+    - scikit-learn==1.7.2
+    - matplotlib==3.10.8
+    - scipy==1.15.3
+    - tqdm==4.67.1
+    - pillow==12.1.0
+    
+    # --- 工具库 ---
+    - einops==0.8.1
+    - addict==2.4.0
+    # 注意：nvidia-* 系列库已移除，pip 安装 torch 时会自动处理
+    # 注意：prefix 路径已移除，防止路径写死
