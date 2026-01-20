@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import gc
-from tqdm import tqdm  # [新增] 引入进度条库
 from src.sleep import sleep_phase
 
 class HOPTrainer:
@@ -11,30 +10,22 @@ class HOPTrainer:
         self.args = args
         self.criterion = nn.CrossEntropyLoss()
         
-        # Hebbian Trace 初始化
+        # Hebbian Trace
         self.importance_matrix = {}
-        
-        # [Optimization] 预先缓存可训练参数
-        # 避免在 train_epoch 的每个 batch 中重复调用 named_parameters() 产生的 CPU 开销
-        self.trainable_params_cache = []
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.importance_matrix[name] = torch.zeros_like(param.data)
-                self.trainable_params_cache.append((name, param))
 
-    def train_epoch(self, loader, prototype_memory, previous_mask, optimizer, epoch_idx=0):
+    def train_epoch(self, loader, prototype_memory, previous_mask, optimizer):
         self.model.train()
         total_loss = 0
         valid_batches = 0
 
         # [Replay Strategy] 混合复习系数
+        # 如果有记忆，loss = loss_new + proto_lambda * loss_old
         proto_lambda = getattr(self.args, 'proto_lambda', 1.0)
 
-        # [新增] 使用 tqdm 包装 loader，显示进度条
-        # desc 显示当前是第几个 Epoch
-        pbar = tqdm(loader, desc=f"  Epoch {epoch_idx+1}/{self.args.epochs}", leave=False)
-
-        for batch in pbar:
+        for batch in loader:
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
@@ -48,12 +39,17 @@ class HOPTrainer:
             # --- Stream B: 旧知识复习 (Wake Replay) ---
             loss_proto = torch.tensor(0.0, device=self.device)
             if prototype_memory is not None and len(prototype_memory.prototypes) > 0:
+                # 获取原型 batch (特征或原始数据)
+                # 注意：memory.py 中存储的是 feature (768维)
+                # 所以我们只能过 classifier，不能过 BERT
                 proto_feats, proto_labels = prototype_memory.get_prototype_batch(batch_size=16)
                 
                 if proto_feats is not None:
                     proto_feats = proto_feats.to(self.device)
                     proto_labels = proto_labels.to(self.device)
                     
+                    # 关键：我们需要一个能直接接受 features 的 forward 接口
+                    # 假设 model.classifier 可以直接处理 features
                     if isinstance(self.model.classifier, nn.Sequential):
                         proto_logits = self.model.classifier(proto_feats)
                     else:
@@ -68,29 +64,25 @@ class HOPTrainer:
             total_loss += total_loss_val.item()
             valid_batches += 1
 
-            # [Optimization] 优化的 Hebbian Accumulation
+            # [Mechanism] Hebbian Accumulation
             with torch.no_grad():
-                for name, param in self.trainable_params_cache:
-                    if param.grad is not None:
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        # 累积梯度的绝对值
                         self.importance_matrix[name] = 0.9 * self.importance_matrix[name] + 0.1 * param.grad.abs()
 
-            # [Optimization] 优化的 Gradient Masking (Protection)
+            # [Mechanism] Gradient Masking (Protection)
             if previous_mask is not None:
-                for name, param in self.trainable_params_cache:
-                    if param.grad is not None and name in previous_mask:
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and param.grad is not None and name in previous_mask:
                         mask = previous_mask[name]
+                        # 强力阻断：受保护参数不更新
                         param.grad *= (1.0 - mask)
 
             optimizer.step()
             
-            # [新增] 实时更新进度条后缀，显示当前 Loss
-            pbar.set_postfix({'loss': f"{total_loss_val.item():.4f}"})
-            
-        # Epoch 结束后的汇总打印
         if valid_batches > 0:
-            avg_loss = total_loss / valid_batches
-            # 可以选择打印或只依赖 tqdm
-            # print(f"    📉 Avg Loss: {avg_loss:.4f}")
+            print(f"    📉 Avg Loss: {total_loss / valid_batches:.4f}")
 
     def train_task(self, loader, prototype_memory, previous_mask):
         optimizer = torch.optim.AdamW(
@@ -99,15 +91,14 @@ class HOPTrainer:
             weight_decay=0.0 
         )
         
-        # 衰减旧重要性
+        # 衰减旧重要性，为新任务腾出记录空间
         for k in self.importance_matrix:
             self.importance_matrix[k] *= 0.1 
 
         print(f"🚀 [Trainer] Start waking training phase for {self.args.epochs} epochs...")
         
         for epoch in range(self.args.epochs):
-            # 传入 epoch 索引以更新进度条描述
-            self.train_epoch(loader, prototype_memory, previous_mask, optimizer, epoch_idx=epoch)
+            self.train_epoch(loader, prototype_memory, previous_mask, optimizer)
             
         torch.cuda.empty_cache()
         gc.collect()
@@ -123,6 +114,7 @@ class HOPTrainer:
             'target_norm': self.args.target_norm
         }
         
+        # 传递 current_mask 以实现累积保护
         self.model, new_mask = sleep_phase(
             self.model, 
             tokenizer, 
@@ -133,13 +125,15 @@ class HOPTrainer:
             previous_mask=current_mask 
         )
         
+        # 更新 Mask (并集策略)
         if new_mask is not None:
             if current_mask is None:
                 current_mask = new_mask
             else:
                 for k, v in new_mask.items():
-                    current_mask[k] = v 
+                    current_mask[k] = v # sleep.py 已经做了 merge 逻辑，这里直接赋值
             
+            # 打印保护比例
             total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
             if total_params > 0:
                 locked_params = sum(m.sum().item() for m in current_mask.values())
@@ -150,14 +144,10 @@ class HOPTrainer:
     def evaluate(self, loader):
         self.model.eval()
         preds, gts = [], []
-        
-        # [可选] 评估也可以加进度条，如果数据很多的话
-        # pbar = tqdm(loader, desc="Evaluating", leave=False)
         with torch.no_grad():
             for batch in loader:
                 logits = self.model(batch['input_ids'].to(self.device), batch['attention_mask'].to(self.device))
                 preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
                 gts.extend(batch['labels'].cpu().numpy())
-                
         from sklearn.metrics import accuracy_score
         return accuracy_score(gts, preds)
