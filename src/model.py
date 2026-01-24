@@ -48,9 +48,9 @@ class CosineLinear(nn.Module):
         self.out_features = out_features
         self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
         
-        # [关键修改] Sigma 初始值设为 30.0
+        # Sigma 初始值设为 30.0
         # 较小的 sigma (如 1.0 或 10.0) 会导致 Softmax 后概率分布过于平坦 (Under-confidence)，
-        # 梯度极小，导致模型无法收敛 (Acc 0%)。
+        # 梯度极小，导致模型无法收敛。
         if sigma:
             self.sigma = nn.Parameter(torch.tensor(30.0))
         else:
@@ -94,8 +94,31 @@ class HOPBertClassifier(nn.Module):
             # 打印可训练参数量
             self.bert.print_trainable_parameters()
         
-        # [关键] 使用 CosineLinear 替换标准 Linear
-        self.classifier = CosineLinear(self.config.hidden_size, num_classes)
+        # ==============================================================================
+        # 🔥【消融实验 D：自毁开关】🔥
+        # 目的：证明 "Synaptic Downscaling (NREM)" 必须配合 "CosineLinear" 才能工作。
+        # 原理：如果用普通 Linear，NREM 的权重衰减会导致输出值变小，Softmax 坍塌，Acc 暴跌。
+        # ==============================================================================
+        
+        # [开关] 设置为 True 以进行 "w/o CosineLinear" 消融实验
+        ABLATION_NO_COSINE = False  
+        
+        if ABLATION_NO_COSINE:
+            print("\n" + "="*80)
+            print("⚠️⚠️ [DANGER] ABLATION EXPERIMENT MODE ACTIVATED: w/o CosineLinear ⚠️⚠️")
+            print("⚠️ Using standard nn.Linear instead of CosineLinear.")
+            print("⚠️ EXPECTATION: Catastrophic Forgetting should occur after NREM sleep.")
+            print("="*80 + "\n")
+            
+            # 使用普通全连接层 (bias=False 以控制变量，因 CosineLinear 无 bias)
+            self.classifier = nn.Linear(self.config.hidden_size, num_classes, bias=False)
+        else:
+            print("\n✅ [Standard] Using Bio-Inspired CosineLinear (Orthogonal Synaptic Homeostasis).")
+            # 你的完整版创新方案
+            self.classifier = CosineLinear(self.config.hidden_size, num_classes)
+            
+        # ==============================================================================
+
         self.dropout = nn.Dropout(self.config.hidden_dropout_prob)
 
     def forward(self, input_ids, attention_mask):

@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--hop_order", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--use_sleep", action="store_true")
     
     # Sleep & Mechanism 参数
