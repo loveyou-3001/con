@@ -26,14 +26,34 @@ def synaptic_downscaling(model, importance_matrix, config, previous_mask):
                 global_masks[name] = torch.ones_like(param)
                 continue
 
-            # 🔥 [豁免 2] LoRA 参数 (CRITICAL FIX)
-            # 因为 REM 阶段使用的是 Prototype (Pooled Output) 作为输入，
-            # 梯度无法回传到 BERT/LoRA 层。
-            # 这意味着 REM 无法修复 LoRA 的损伤。
-            # 因此，NREM 阶段必须给予 LoRA "绝对豁免权"，严禁触碰！
+            # 🔥 [豁免 2] LoRA 软豁免 (Adaptive Plasticity)
+            # 策略演进：从"绝对豁免 (100%)"升级为"软豁免 (99%)"
+            # 
+            # 原因：经过多个任务后，完全冻结的 LoRA 无法学习新特征模式
+            # 解决：保留 1% 的可塑性，允许基于重要性的微调
+            # 
+            # 关键参数：
+            #   - Soft Alpha = 0.01 (仅 1% 衰减，99% 保留)
+            #   - 依然使用重要性矩阵指导，保护关键神经元
+            #   - REM 虽然无法修复 LoRA，但软豁免的衰减极小，风险可控
             if 'lora' in name:
-                # print(f"      [Immunity] LoRA parameter protected: {name}")
-                global_masks[name] = torch.ones_like(param)
+                # 先获取 LoRA 的重要性分数
+                if name in importance_matrix:
+                    imp = importance_matrix[name]
+                    if imp.max() > 0:
+                        lora_imp_norm = imp / (imp.max() + 1e-8)
+                    else:
+                        lora_imp_norm = torch.zeros_like(param)
+                else:
+                    lora_imp_norm = torch.zeros_like(param)
+                
+                # 软性衰减：只对不重要的参数施加极轻微的压力
+                soft_alpha = 0.01  # 👈 控制可塑性 (0.01 = 1% 衰减, 0.02 = 2% 衰减)
+                decay = 1.0 - soft_alpha * (1.0 - lora_imp_norm)
+                param.data *= decay
+                
+                # Mask 标记为 99% 保护（留 1% 自由度）
+                global_masks[name] = torch.ones_like(param) * 0.99
                 continue
 
             # --- 以下仅对 Classifier 的权重执行缩减 ---
@@ -115,9 +135,12 @@ def rem_consolidation(model, prototype_memory, device, config):
     # 保持适度不确定性，防止震荡。
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    # 5. [以时间换精度] 600 Cycles
-    # 既然 LoRA 没坏，Classifier 只要多花点时间精调，99% 是必然的。
-    dream_cycles = 600
+    # 5. [动态周期] 根据类别数量自适应调整
+    # 公式: max(600, min(1500, num_classes * 10))
+    # 原理: 类别越多，决策边界越复杂，需要更多训练时间
+    num_classes = len(prototype_memory.prototypes)
+    dream_cycles = max(600, min(1500, num_classes * 10))
+    print(f"      [REM Config] Classes: {num_classes}, Dream Cycles: {dream_cycles}")
     noise_std = 0.1    
     
     for i in range(dream_cycles):
