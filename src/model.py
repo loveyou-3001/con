@@ -74,7 +74,7 @@ class CosineLinear(nn.Module):
         return torch.mm(out_norm, w_norm.t()) * self.sigma
 
 class HOPBertClassifier(nn.Module):
-    def __init__(self, bert_path, num_classes, hop_order=2, use_lora=True):
+    def __init__(self, bert_path, num_classes, hop_order=2, use_lora=True, use_cosine=True):
         super(HOPBertClassifier, self).__init__()
         print(f"🏗️ Loading BERT from: {bert_path}")
         self.config = AutoConfig.from_pretrained(bert_path)
@@ -95,26 +95,21 @@ class HOPBertClassifier(nn.Module):
             self.bert.print_trainable_parameters()
         
         # ==============================================================================
-        # 🔥【消融实验 D：自毁开关】🔥
-        # 目的：证明 "Synaptic Downscaling (NREM)" 必须配合 "CosineLinear" 才能工作。
-        # 原理：如果用普通 Linear，NREM 的权重衰减会导致输出值变小，Softmax 坍塌，Acc 暴跌。
+        # 🔬 分类器选择 (支持消融实验)
+        # use_cosine=True:  使用 CosineLinear (默认，抗 NREM 压缩)
+        # use_cosine=False: 使用 nn.Linear (消融实验 A1)
         # ==============================================================================
         
-        # [开关] 设置为 True 以进行 "w/o CosineLinear" 消融实验
-        ABLATION_NO_COSINE = False  
-        
-        if ABLATION_NO_COSINE:
+        if not use_cosine:
             print("\n" + "="*80)
-            print("⚠️⚠️ [DANGER] ABLATION EXPERIMENT MODE ACTIVATED: w/o CosineLinear ⚠️⚠️")
-            print("⚠️ Using standard nn.Linear instead of CosineLinear.")
-            print("⚠️ EXPECTATION: Catastrophic Forgetting should occur after NREM sleep.")
+            print("⚠️⚠️ [ABLATION A1] w/o CosineLinear - Using nn.Linear ⚠️⚠️")
+            print("⚠️ EXPECTATION: Accuracy may drop after NREM compression.")
             print("="*80 + "\n")
             
-            # 使用普通全连接层 (bias=False 以控制变量，因 CosineLinear 无 bias)
+            # 使用普通全连接层 (bias=False 以控制变量)
             self.classifier = nn.Linear(self.config.hidden_size, num_classes, bias=False)
         else:
             print("\n✅ [Standard] Using Bio-Inspired CosineLinear (Orthogonal Synaptic Homeostasis).")
-            # 你的完整版创新方案
             self.classifier = CosineLinear(self.config.hidden_size, num_classes)
             
         # ==============================================================================

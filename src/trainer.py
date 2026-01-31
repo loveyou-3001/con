@@ -120,7 +120,10 @@ class HOPTrainer:
         
         config = {
             'alpha': self.args.alpha,
-            'target_norm': self.args.target_norm
+            'target_norm': self.args.target_norm,
+            # 消融实验参数
+            'no_rem': getattr(self.args, 'no_rem', False),
+            'lora_alpha': getattr(self.args, 'lora_alpha', 0.01),
         }
         
         self.model, new_mask = sleep_phase(

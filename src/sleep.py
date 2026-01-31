@@ -37,6 +37,16 @@ def synaptic_downscaling(model, importance_matrix, config, previous_mask):
             #   - 依然使用重要性矩阵指导，保护关键神经元
             #   - REM 虽然无法修复 LoRA，但软豁免的衰减极小，风险可控
             if 'lora' in name:
+                # 从 config 读取 LoRA 软豁免强度 (支持消融实验 A4)
+                # lora_alpha=0: 完全冻结 (消融实验)
+                # lora_alpha=0.01: 1% 可塑性 (默认)
+                soft_alpha = config.get('lora_alpha', 0.01)
+                
+                # 消融实验 A4: 完全冻结 LoRA
+                if soft_alpha == 0:
+                    global_masks[name] = torch.ones_like(param)
+                    continue
+                
                 # 先获取 LoRA 的重要性分数
                 if name in importance_matrix:
                     imp = importance_matrix[name]
@@ -47,13 +57,12 @@ def synaptic_downscaling(model, importance_matrix, config, previous_mask):
                 else:
                     lora_imp_norm = torch.zeros_like(param)
                 
-                # 软性衰减：只对不重要的参数施加极轻微的压力
-                soft_alpha = 0.01  # 👈 控制可塑性 (0.01 = 1% 衰减, 0.02 = 2% 衰减)
+                # 软性衰减：只对不重要的参数施加轻微压力
                 decay = 1.0 - soft_alpha * (1.0 - lora_imp_norm)
                 param.data *= decay
                 
-                # Mask 标记为 99% 保护（留 1% 自由度）
-                global_masks[name] = torch.ones_like(param) * 0.99
+                # Mask 标记保护程度
+                global_masks[name] = torch.ones_like(param) * (1.0 - soft_alpha)
                 continue
 
             # --- 以下仅对 Classifier 的权重执行缩减 ---
@@ -177,7 +186,13 @@ def rem_consolidation(model, prototype_memory, device, config):
 
 def sleep_phase(model, tokenizer, device, config, importance_matrix, prototype_memory, previous_mask):
     model, masks = synaptic_downscaling(model, importance_matrix, config, previous_mask)
-    model = rem_consolidation(model, prototype_memory, device, config)
+    
+    # 消融实验 A3: 跳过 REM 阶段
+    if config.get('no_rem', False):
+        print("   ⚠️ [ABLATION A3] Skipping REM phase...")
+    else:
+        model = rem_consolidation(model, prototype_memory, device, config)
+    
     for k in importance_matrix:
         importance_matrix[k].zero_()
     return model, masks

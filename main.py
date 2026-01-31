@@ -47,7 +47,12 @@ def parse_args():
     parser.add_argument("--beta", type=float, default=0.02)
     parser.add_argument("--feat_lambda", type=float, default=5.0)
     parser.add_argument("--proto_lambda", type=float, default=2.0) # 建议设为 2.0 增强复习
-    parser.add_argument("--kd_lambda", type=float, default=0.0)    
+    parser.add_argument("--kd_lambda", type=float, default=0.0)
+    
+    # === 消融实验参数 ===
+    parser.add_argument("--no_rem", action="store_true", help="[Ablation A3] 跳过 REM 阶段")
+    parser.add_argument("--lora_alpha", type=float, default=0.01, help="[Ablation A4] LoRA 软豁免强度 (0=完全冻结, 0.01=1%可塑性)")
+    parser.add_argument("--no_cosine", action="store_true", help="[Ablation A1] 使用 nn.Linear 替代 CosineLinear")    
     
     return parser.parse_args()
 
@@ -67,7 +72,13 @@ def main():
     # 使用 args.model_id 更加灵活
     model_path = get_bert_path(args.model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = HOPBertClassifier(model_path, num_classes=args.num_classes, hop_order=args.hop_order, use_lora=True).to(device)
+    model = HOPBertClassifier(
+        model_path, 
+        num_classes=args.num_classes, 
+        hop_order=args.hop_order, 
+        use_lora=True,
+        use_cosine=not args.no_cosine  # 消融实验: --no_cosine 时使用 nn.Linear
+    ).to(device)
     
     prototype_memory = PrototypeMemory(args.num_classes, 768, device)
     trainer = HOPTrainer(model, device, args) 
@@ -127,8 +138,14 @@ def main():
             except:
                 task_num_classes = args.num_classes
 
-            # 实例化评估模型
-            eval_model = HOPBertClassifier(model_path, num_classes=args.num_classes, hop_order=args.hop_order, use_lora=False)
+            # 实例化评估模型 (需要与训练模型使用相同的配置)
+            eval_model = HOPBertClassifier(
+                model_path, 
+                num_classes=args.num_classes, 
+                hop_order=args.hop_order, 
+                use_lora=False,
+                use_cosine=not args.no_cosine  # 保持与训练模型一致
+            )
             
             # 加载 LoRA 权重
             eval_ckpt_dir = os.path.join(output_dir, f"task_{eval_id}")
