@@ -24,11 +24,9 @@ def setup_seed(seed):
     print(f"🔒 随机种子已锁定: {seed}")
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Sleep-HOP: PCGrad & Asymmetric Routing")
-    parser.add_argument("--exp_name", type=str, required=True)
+    parser = argparse.ArgumentParser(description="Sleep-HOP: Orthogonal Synaptic Homeostasis")
+    parser.add_argument("--exp_name", type=str, required=True, help="实验名称，用于保存输出")
     parser.add_argument("--data_root", type=str, default="data/clinc150")
-    
-    # [新增] 显式支持 model_id 防止报错
     parser.add_argument("--model_id", type=str, default="bert-base-uncased")
     
     parser.add_argument("--seed", type=int, default=42)
@@ -38,21 +36,17 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--use_sleep", action="store_true")
+    parser.add_argument("--use_sleep", action="store_true", help="是否启用睡眠机制")
     
-    # Sleep & Mechanism 参数
-    parser.add_argument("--threshold", type=float, default=50) 
-    parser.add_argument("--target_norm", type=float, default=11.5)
-    parser.add_argument("--alpha", type=float, default=0.02)
-    parser.add_argument("--beta", type=float, default=0.02)
-    parser.add_argument("--feat_lambda", type=float, default=5.0)
-    parser.add_argument("--proto_lambda", type=float, default=2.0) # 建议设为 2.0 增强复习
-    parser.add_argument("--kd_lambda", type=float, default=0.0)
+    # --- Sleep & Mechanism 核心参数 ---
+    parser.add_argument("--target_norm", type=float, default=11.5, help="NREM 权重天花板")
+    parser.add_argument("--alpha", type=float, default=0.5, help="NREM 压缩强度")
+    parser.add_argument("--proto_lambda", type=float, default=2.0, help="Wake 阶段原型回放强度")
     
-    # === 消融实验参数 ===
-    parser.add_argument("--no_rem", action="store_true", help="[Ablation A3] 跳过 REM 阶段")
-    parser.add_argument("--lora_alpha", type=float, default=0.01, help="[Ablation A4] LoRA 软豁免强度 (0=完全冻结, 0.01=1%可塑性)")
-    parser.add_argument("--no_cosine", action="store_true", help="[Ablation A1] 使用 nn.Linear 替代 CosineLinear")    
+    # --- 消融实验专用开关 ---
+    parser.add_argument("--no_rem", action="store_true", help="[Ablation A3] 跳过 REM 梦境修复")
+    parser.add_argument("--lora_alpha", type=float, default=0.01, help="[Ablation A4] LoRA 软豁免强度")
+    parser.add_argument("--no_cosine", action="store_true", help="[Ablation A1] 禁用 CosineLinear")    
     
     return parser.parse_args()
 
@@ -61,6 +55,7 @@ def main():
     setup_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    # 1. 环境准备
     output_dir = os.path.join("output", args.exp_name)
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "config.json"), "w") as f:
@@ -68,8 +63,7 @@ def main():
         
     print(f"🚀 实验启动: {args.exp_name} (Modular Optimized)")
     
-    # 初始化模型
-    # 使用 args.model_id 更加灵活
+    # 2. 初始化组件
     model_path = get_bert_path(args.model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = HOPBertClassifier(
@@ -77,105 +71,93 @@ def main():
         num_classes=args.num_classes, 
         hop_order=args.hop_order, 
         use_lora=True,
-        use_cosine=not args.no_cosine  # 消融实验: --no_cosine 时使用 nn.Linear
+        use_cosine=not args.no_cosine
     ).to(device)
-    
+
     prototype_memory = PrototypeMemory(args.num_classes, 768, device)
     trainer = HOPTrainer(model, device, args) 
-    
+
     R = np.zeros((args.num_tasks, args.num_tasks))
     current_mask = None
 
-    # === 持续学习循环 ===
+    # 3. 持续学习循环
     for task_id in range(args.num_tasks):
-        print(f"\n=== Task {task_id} ===")
+        print(f"\n" + "="*20 + f" Task {task_id} " + "="*20)
         
-        # 1. 准备数据
+        # --- A. 准备数据 ---
         train_path = os.path.join(args.data_root, f"task_{task_id}", "train.json")
         if not os.path.exists(train_path): 
-            print(f"⚠️ 数据文件不存在: {train_path}，停止实验。")
-            break
+            print(f"⚠️ 找不到任务数据: {train_path}，跳过该任务。")
+            continue
             
         train_dataset = JSONLDataset(train_path, tokenizer)
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
         
-        # 2. 训练 (委托给 Trainer)
-        # Trainer 内部会自动处理 Stream A (新任务) 和 Stream B (复习)
+        # --- B. 清醒学习 (Wake Phase) ---
+        print(f"☀️ [Wake] 正在训练新任务...")
         trainer.train_task(train_loader, prototype_memory, current_mask)
         
-        # 3. 更新记忆 (海马体)
-        print("🧠 [Hippocampus] 正在更新原型记忆...")
+        # --- C. 记忆巩固 (Update Prototypes) ---
+        # 使用当前任务的数据集生成高斯原型
+        print("🧠 [Hippocampus] 正在更新高斯原型记忆...")
         prototype_loader = DataLoader(train_dataset, batch_size=32, shuffle=False)
         prototype_memory.update_prototypes(model, prototype_loader, device)
 
-        # 4. 睡眠阶段 (Sleep Phase)
-        # [CRITICAL FIX] 必须传入 prototype_memory，否则 REM 梦境无法运行
-        model, current_mask = trainer.sleep(tokenizer, current_mask, prototype_memory)
+        # --- D. 睡眠阶段 (Sleep Phase: NREM + REM) ---
+        if args.use_sleep:
+            # 这里的 trainer.sleep 内部会自动调用我们修复过的 synaptic_downscaling
+            model, current_mask = trainer.sleep(tokenizer, current_mask, prototype_memory)
         
-        # 5. 保存检查点
+        # --- E. 保存进度 (Checkpoints) ---
         task_ckpt_dir = os.path.join(output_dir, f"task_{task_id}")
+        os.makedirs(task_ckpt_dir, exist_ok=True)
+        # 只保存增量部分：LoRA 和 Classifier Head
         model.bert.save_pretrained(task_ckpt_dir)
         torch.save(model.classifier.state_dict(), os.path.join(task_ckpt_dir, "head.pth"))
         
-        # 6. 评估所有历史任务
-        print(f"🧐 正在评估 Task 0 -> Task {task_id}...")
+        # --- F. 评估所有已学任务 (Evaluate All Learned Tasks) ---
+        print(f"🧐 正在评估历史任务性能 (Task 0 -> {task_id})...")
         accs = []
-        for eval_id in range(task_id + 1):
-            test_path = os.path.join(args.data_root, f"task_{eval_id}", "test.json")
-            test_loader = DataLoader(JSONLDataset(test_path, tokenizer), batch_size=64)
-            
-            # 临时加载模型进行评估
-            # 注意：评估时不需要 LoRA 的梯度，也不需要 CosineLinear 的 Sigma 梯度
-            # 动态计算类别数防止越界
-            labels_in_task = set()
-            try:
-                with open(test_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if line.strip():
-                            item = json.loads(line)
-                            labels_in_task.add(item['label'])
-                task_num_classes = max(labels_in_task) + 1
-            except:
-                task_num_classes = args.num_classes
-
-            # 实例化评估模型 (需要与训练模型使用相同的配置)
-            eval_model = HOPBertClassifier(
-                model_path, 
-                num_classes=args.num_classes, 
-                hop_order=args.hop_order, 
-                use_lora=False,
-                use_cosine=not args.no_cosine  # 保持与训练模型一致
-            )
-            
-            # 加载 LoRA 权重
-            eval_ckpt_dir = os.path.join(output_dir, f"task_{eval_id}")
-            eval_model.bert = PeftModel.from_pretrained(eval_model.bert, eval_ckpt_dir, is_trainable=False)
-            # 加载 Classifier 权重
-            eval_model.classifier.load_state_dict(torch.load(os.path.join(eval_ckpt_dir, "head.pth")))
-            
-            eval_model.to(device)
-            eval_model.eval()
-            
-            # 使用 Trainer 的 evaluate 方法
-            eval_trainer = HOPTrainer(eval_model, device, args)
-            acc = eval_trainer.evaluate(test_loader)
-            
-            del eval_model, eval_trainer
-            torch.cuda.empty_cache()
-            
-            accs.append(acc)
-            R[task_id, eval_id] = acc
+        model.eval() # 切换到评估模式
         
-        print(f"👉 Avg Acc: {np.mean(accs)*100:.2f}% | Task 0 Acc: {accs[0]*100:.2f}%")
-        print(f"📊 { [f'{x*100:.1f}' for x in accs] }")
+        with torch.no_grad():
+            for eval_id in range(task_id + 1):
+                test_path = os.path.join(args.data_root, f"task_{eval_id}", "test.json")
+                if not os.path.exists(test_path):
+                    accs.append(0.0)
+                    continue
+                
+                test_loader = DataLoader(JSONLDataset(test_path, tokenizer), batch_size=64)
+                # 🌟 优化：直接使用内存中的模型进行评估，避免重复加载导致的显存溢出
+                acc = trainer.evaluate(test_loader)
+                accs.append(acc)
+                R[task_id, eval_id] = acc
+        
+        # 实时打印成绩单
+        avg_acc = np.mean(accs) * 100
+        print(f"📊 Task {task_id} 完结成绩单:")
+        print(f"   > Average Accuracy: {avg_acc:.2f}%")
+        print(f"   > Current Acc List: {[f'{x*100:.1f}' for x in accs]}")
 
-    # === 实验结束结算 ===
+    # 4. 最终结算
     if args.num_tasks > 0:
-        final_avg = np.mean(R[args.num_tasks-1, :args.num_tasks])
-        bwt = np.mean([R[args.num_tasks-1, i] - R[i, i] for i in range(args.num_tasks - 1)])
+        final_idx = args.num_tasks - 1
+        final_avg = np.mean(R[final_idx, :args.num_tasks])
+        # 计算向后遗忘率 (BWT): 越接近 0 越好
+        bwt = np.mean([R[final_idx, i] - R[i, i] for i in range(args.num_tasks - 1)]) if args.num_tasks > 1 else 0
+        
+        results = {
+            "final_avg": float(final_avg),
+            "bwt": float(bwt),
+            "matrix": R.tolist()
+        }
         with open(os.path.join(output_dir, "results.json"), "w") as f:
-            json.dump({"final_avg": final_avg, "bwt": bwt, "R": R.tolist()}, f, indent=4)
-        print(f"\n🏆 Final Avg: {final_avg*100:.2f}% | BWT: {bwt*100:.2f}%")
+            json.dump(results, f, indent=4)
+            
+        print("\n" + "🏆" * 10)
+        print(f"最终平均准确率 (Final Avg): {final_avg*100:.2f}%")
+        print(f"向后遗忘率 (BWT): {bwt*100:.2f}%")
+        print("🏆" * 10)
 
 if __name__ == "__main__":
     main()
