@@ -98,16 +98,21 @@ def main():
         print(f"☀️ [Wake] 正在训练新任务...")
         trainer.train_task(train_loader, prototype_memory, current_mask)
         
-        # --- C. 记忆巩固 (Update Prototypes) ---
-        # 使用当前任务的数据集生成高斯原型
-        print("🧠 [Hippocampus] 正在更新高斯原型记忆...")
+        # 提前构建原型加载器（Sleep 内部 NREM 后刷新 + Sleep 后最终更新 都需要它）
         prototype_loader = DataLoader(train_dataset, batch_size=32, shuffle=False)
-        prototype_memory.update_prototypes(model, prototype_loader, device)
 
         # --- D. 睡眠阶段 (Sleep Phase: NREM + REM) ---
         if args.use_sleep:
-            # 这里的 trainer.sleep 内部会自动调用我们修复过的 synaptic_downscaling
-            model, current_mask = trainer.sleep(tokenizer, current_mask, prototype_memory)
+            # prototype_loader 传入 sleep，在 NREM 结束后、REM 开始前刷新当前任务原型
+            model, current_mask = trainer.sleep(tokenizer, current_mask, prototype_memory,
+                                                prototype_loader=prototype_loader)
+
+        # --- C. 记忆巩固 (Update Prototypes) ---
+        # ✅ [坐标系修复] 移至 Sleep 之后：原型与 post-NREM+REM 特征空间对齐
+        # 旧（Sleep 前）：原型在 pre-NREM 坐标系 → 下一轮 REM 使用过时原型 → 分布不匹配
+        # 新（Sleep 后）：原型在 post-Sleep 坐标系 → 下一轮 REM 使用最新坐标 → 准确边界
+        print("🧠 [Hippocampus] 正在更新高斯原型记忆 (post-sleep 坐标系对齐)...")
+        prototype_memory.update_prototypes(model, prototype_loader, device)
         
         # --- E. 保存进度 (Checkpoints) ---
         task_ckpt_dir = os.path.join(output_dir, f"task_{task_id}")

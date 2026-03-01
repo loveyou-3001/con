@@ -26,9 +26,14 @@ class HOPTrainer:
         total_loss = 0
         valid_batches = 0
 
-        # 现在我们有了正交投影，蒸馏系数可以恢复到温和的 1.0
         proto_lambda = getattr(self.args, 'proto_lambda', 1.0)
         distill_lambda = getattr(self.args, 'distill_lambda', 1.0)
+
+        # 预计算：当前是否存在历史精英神经元（避免在每个 batch 内重复调用 .any()）
+        # Task 0 时 lifetime_elite_mask 全为 0，has_elite=False，跳过所有保护逻辑
+        has_elite = bool(self.lifetime_elite_mask) and any(
+            m.any().item() for m in self.lifetime_elite_mask.values()
+        )
 
         pbar = tqdm(loader, desc=f"  Epoch {epoch_idx+1}/{self.args.epochs}", leave=False)
 
@@ -79,51 +84,40 @@ class HOPTrainer:
                         # 新累加：task_importance = Σ|∂L/∂θ|，等价于 Taylor 重要性，学术标准做法
                         self.task_importance[name] += param.grad.abs()
 
-            # 🌟 [Optimization] SVD 正交梯度投影 (Orthogonal Gradient Projection) 🌟
+            # 🔒 [Hard Subnetwork Masking] 绝对物理梯度隔离
+            # 放弃有损的 SVD 近似，直接用终身精英二值掩码对梯度进行硬清零
+            # mask=1 (精英): (1-1)=0 → 梯度强制清零，任何新任务的学习绝对无法侵入
+            # mask=0 (非精英): (1-0)=1 → 梯度完整保留，新任务在此自由生长
             with torch.no_grad():
                 for name, param in self.trainable_params_cache:
-                    if param.grad is not None:
-                        # 1. 针对 2D 参数矩阵 (LoRA, Classifier) 的高阶正交投影
-                        if hasattr(self, 'orthogonal_bases') and name in self.orthogonal_bases:
-                            P = self.orthogonal_bases[name]
-                            grad_2d = param.grad.view(param.shape[0], -1).float()
-                            # 矩阵乘法：强制抹除梯度在旧知识特征空间上的所有分量
-                            proj_grad = torch.mm(grad_2d, P)
-                            param.grad.copy_(proj_grad.view_as(param.grad))
-                            
-                        # 2. 针对 1D 参数 (如 Bias) 的降级元素掩码保护
-                        elif previous_mask is not None and name in previous_mask:
-                            mask = previous_mask[name]
-                            param.grad *= (1.0 - mask)
+                    if param.grad is not None and name in self.lifetime_elite_mask:
+                        param.grad *= (1.0 - self.lifetime_elite_mask[name].to(param.device))
 
-            # ✅ [Adam 泄漏修复] 后处理参数投影 (Post-Step Weight Projection)
-            # 根因：Adam 的分母 1/√v_t 对动量逐元素缩放，破坏其在零空间内的方向
-            #   设 x ∈ Null(P)，但 x_i / √v_i 逐元素除以不同数后，结果一般已不在 Null(P)
-            # 修复：Step 前快照旧权重，Step 后将实际位移 Δ = W_new - W_old 投影回零空间
-            #   W_corrected = W_old + P(Δ)，保证参数实际变化量绝对不侵入旧知识方向
-            # 注：Adam 动量（分子）因线性性质对零空间是安全的，只有分母需要此修复
-            has_svd = hasattr(self, 'orthogonal_bases') and bool(self.orthogonal_bases)
-            if has_svd:
-                # 只克隆有正交基的参数，跳过无需投影的参数，避免不必要的显存分配
-                old_weights = {name: param.data.clone()
-                               for name, param in self.trainable_params_cache
-                               if name in self.orthogonal_bases}
+            # ✅ [Adam 泄漏修复] Pre-Step 快照 → Post-Step 精英还原
+            # 根因：即使梯度被清零，Adam 中已积累的历史动量 m_t 不会立即归零
+            #   m_t = β₁·m_{t-1} + (1-β₁)·0 = β₁·m_{t-1}  (指数衰减但非零!)
+            #   optimizer.step() 仍会给精英神经元施加一个衰减中的残余位移
+            # 修复策略：Step 前克隆精英权重 → Step 后将精英位置强制还原
+            #   非精英位置：保留 Adam 的正常更新，不受影响
+            if has_elite:
+                elite_snapshot = {
+                    name: param.data.clone()
+                    for name, param in self.trainable_params_cache
+                    if name in self.lifetime_elite_mask
+                }
 
             optimizer.step()
 
-            if has_svd:
+            if has_elite:
                 with torch.no_grad():
                     for name, param in self.trainable_params_cache:
-                        if name in self.orthogonal_bases:
-                            P = self.orthogonal_bases[name]
-                            # 1. 提取 Adam 实际走出的扭曲位移（含分母缩放的歪斜）
-                            delta = param.data - old_weights[name]
-                            delta_2d = delta.view(param.shape[0], -1).float()
-                            # 2. 强行将位移拉回完美的正交零空间
-                            proj_delta = torch.mm(delta_2d, P)
-                            # 3. 用「旧权重 + 零空间位移」替换 Adam 的扭曲结果
-                            corrected = old_weights[name].view(param.shape[0], -1).float() + proj_delta
-                            param.data.copy_(corrected.view_as(param.data))
+                        if name in elite_snapshot:
+                            mask = self.lifetime_elite_mask[name].to(param.device)
+                            # 精英位置(mask=1)：强制还原 Step 前的值，完全消除 Adam 动量漂移
+                            # 非精英位置(mask=0)：保留 Adam 正常更新
+                            param.data.copy_(
+                                mask * elite_snapshot[name] + (1.0 - mask) * param.data
+                            )
 
             
             pbar.set_postfix({'Loss': f"{total_loss_val.item():.3f}"})
@@ -140,51 +134,14 @@ class HOPTrainer:
             self.task_importance[k].zero_()
 
         frozen_model = None
-        self.orthogonal_bases = {} # 初始化正交矩阵字典
-        
+
         if previous_mask is not None:
             print("🧠 [Distillation] 捕捉当前脑部快照，作为学习新任务的'潜意识模板'...")
             frozen_model = copy.deepcopy(self.model)
             frozen_model.eval()
             for param in frozen_model.parameters():
                 param.requires_grad = False
-                
-            # 🌟 核心引擎：计算 Hebbian-SVD 投影矩阵
-            print("📐 [Orthogonal] 计算 Hebbian-SVD 梯度正交投影矩阵 (保护核心特征子空间)...")
-            for name, param in self.model.named_parameters():
-                # 只对 2D 以上的矩阵进行 SVD 分解
-                # ✅ [双字典] 使用 lifetime_elite_mask（绝对 0/1 二值图）
-                # 所有历史任务的精英神经元地位平等，SVD 只看拓扑结构，不受量级影响
-                if param.requires_grad and param.dim() > 1 and name in self.lifetime_elite_mask:
-                    imp_mat = self.lifetime_elite_mask[name].view(param.shape[0], -1).float()
-                    
-                    if imp_mat.sum() == 0:
-                        continue
-                        
-                    try:
-                        # 奇异值分解
-                        U, S, Vh = torch.linalg.svd(imp_mat, full_matrices=False)
-                        
-                        # 截断策略：提取包含 90% 能量的主成分方向
-                        total_energy = (S ** 2).sum()
-                        current_energy = 0
-                        k = 0
-                        for i in range(len(S)):
-                            current_energy += S[i] ** 2
-                            if current_energy / total_energy > 0.90:
-                                k = i + 1
-                                break
-                                
-                        if k > 0:
-                            V_k = Vh[:k, :].T  # [in_dim, k]
-                            # P = I - V * V^T (构建正交零空间)
-                            I = torch.eye(imp_mat.shape[1], device=self.device)
-                            P = I - torch.mm(V_k, V_k.T)
-                            self.orthogonal_bases[name] = P
-                    except RuntimeError as e:
-                        # 防止 SVD 在极端情况下不收敛
-                        print(f"   ⚠️ SVD failed for {name}, fallback to default masking.")
-                        pass
+            print("🔒 [Hard Masking] 梯度保护模式：终身精英神经元绝对锁定 (SVD-free)")
 
         print(f"🚀 [Trainer] Start waking training phase for {self.args.epochs} epochs...")
         
@@ -226,7 +183,7 @@ class HOPTrainer:
         torch.cuda.empty_cache()
         gc.collect()
 
-    def sleep(self, tokenizer, current_mask, prototype_memory):
+    def sleep(self, tokenizer, current_mask, prototype_memory, prototype_loader=None):
         if not self.args.use_sleep:
             return self.model, current_mask
             
@@ -244,9 +201,10 @@ class HOPTrainer:
             tokenizer, 
             self.device, 
             config, 
-            self.lifetime_elite_mask,   # ✅ [双字典] 传入绝对 0/1 精英掩码，sleep 无需任何 quantile 计算
+            self.lifetime_elite_mask,
             prototype_memory,
-            previous_mask=current_mask 
+            previous_mask=current_mask,
+            prototype_loader=prototype_loader,   # ✅ [坐标系修复] NREM 后、REM 前刷新原型
         )
         
         if new_mask is not None:
