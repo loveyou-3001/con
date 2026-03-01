@@ -12,13 +12,13 @@ class HOPTrainer:
         self.args = args
         self.criterion = nn.CrossEntropyLoss()
         
-        self.importance_matrix = {}    # 当前任务实时积累器（每次新任务前清零）
-        self.lifetime_importance = {}    # 终身记忆：跨所有任务的最大重要性总图
+        self.task_importance = {}       # 字典 A：当前任务活跃度积累器（每次新任务前清零）
+        self.lifetime_elite_mask = {}   # 字典 B：终身精英保护图（绝对 0/1，只增不减）
         self.trainable_params_cache = []
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                self.importance_matrix[name] = torch.zeros_like(param.data)
-                self.lifetime_importance[name] = torch.zeros_like(param.data)
+                self.task_importance[name] = torch.zeros_like(param.data)
+                self.lifetime_elite_mask[name] = torch.zeros_like(param.data)
                 self.trainable_params_cache.append((name, param))
 
     def train_epoch(self, loader, prototype_memory, previous_mask, optimizer, frozen_model=None, epoch_idx=0):
@@ -74,7 +74,7 @@ class HOPTrainer:
             with torch.no_grad():
                 for name, param in self.trainable_params_cache:
                     if param.grad is not None:
-                        self.importance_matrix[name] = 0.9 * self.importance_matrix[name] + 0.1 * param.grad.abs()
+                        self.task_importance[name] = 0.9 * self.task_importance[name] + 0.1 * param.grad.abs()
 
             # 🌟 [Optimization] SVD 正交梯度投影 (Orthogonal Gradient Projection) 🌟
             with torch.no_grad():
@@ -104,10 +104,9 @@ class HOPTrainer:
             weight_decay=0.0 
         )
         
-        # ✅ [方案A] 只清零当前任务积累器，不触动终身记忆
-        # 旧代码 *= 0.1 会让 Task 0 的印记在 Task 2 后衰减至 1%，导致 SVD 遗忘
-        for k in self.importance_matrix:
-            self.importance_matrix[k].zero_()
+        # ✅ [双字典] 只清零当前任务积累器，终身精英掩码绝不触动
+        for k in self.task_importance:
+            self.task_importance[k].zero_()
 
         frozen_model = None
         self.orthogonal_bases = {} # 初始化正交矩阵字典
@@ -123,9 +122,10 @@ class HOPTrainer:
             print("📐 [Orthogonal] 计算 Hebbian-SVD 梯度正交投影矩阵 (保护核心特征子空间)...")
             for name, param in self.model.named_parameters():
                 # 只对 2D 以上的矩阵进行 SVD 分解
-                # ✅ [方案A] 使用 lifetime_importance（终身记忆），而非会衰减的当前积累器
-                if param.requires_grad and param.dim() > 1 and name in self.lifetime_importance:
-                    imp_mat = self.lifetime_importance[name].view(param.shape[0], -1).float()
+                # ✅ [双字典] 使用 lifetime_elite_mask（绝对 0/1 二值图）
+                # 所有历史任务的精英神经元地位平等，SVD 只看拓扑结构，不受量级影响
+                if param.requires_grad and param.dim() > 1 and name in self.lifetime_elite_mask:
+                    imp_mat = self.lifetime_elite_mask[name].view(param.shape[0], -1).float()
                     
                     if imp_mat.sum() == 0:
                         continue
@@ -167,15 +167,29 @@ class HOPTrainer:
                 epoch_idx=epoch
             )
         
-        # ✅ [方案A] 训练结束后，将当前任务的重要性用 max 合并进终身记忆
-        # max 合并保证：任何任务中最重要的神经元永远不会在后续 SVD 中被遗忘
-        print("📚 [Lifetime Memory] 合并当前任务重要性到终身记忆 (max-union)...")
+        # ✅ [双字典] 从本任务 task_importance 独立提取精英，永久固化入终身二值掩码
+        # 关键：精英评选完全在本任务内部完成，T1 的梯度量级永远无法影响 T0 的精英资格
+        # max 合并 0/1 掩码：一旦当过精英（=1），永不降级
+        print("📚 [Lifetime Elite] 提取本任务精英神经元并永久固化 (0/1 binary union)...")
         with torch.no_grad():
-            for k in self.importance_matrix:
-                if k in self.lifetime_importance:
-                    self.lifetime_importance[k] = torch.max(
-                        self.lifetime_importance[k],
-                        self.importance_matrix[k]
+            for k in self.task_importance:
+                imp = self.task_importance[k]
+                if imp.max() > 0:
+                    # 分类器按行提取精英（行 = 类别节点），其余参数按元素提取
+                    if 'classifier' in k and imp.dim() > 1:
+                        row_imp = imp.mean(dim=1, keepdim=True)
+                        threshold = torch.quantile(row_imp.float(), 0.85)
+                        current_elite = (row_imp > threshold).float().expand_as(imp)
+                    else:
+                        threshold = torch.quantile(imp.float(), 0.85)
+                        current_elite = (imp > threshold).float()
+                else:
+                    current_elite = torch.zeros_like(imp)
+
+                if k in self.lifetime_elite_mask:
+                    self.lifetime_elite_mask[k] = torch.max(
+                        self.lifetime_elite_mask[k],
+                        current_elite
                     )
             
         torch.cuda.empty_cache()
@@ -199,7 +213,7 @@ class HOPTrainer:
             tokenizer, 
             self.device, 
             config, 
-            self.lifetime_importance,   # ✅ [方案A] 使用终身记忆，让 sleep 阶段也感知所有历史任务的重要性
+            self.lifetime_elite_mask,   # ✅ [双字典] 传入绝对 0/1 精英掩码，sleep 无需任何 quantile 计算
             prototype_memory,
             previous_mask=current_mask 
         )
