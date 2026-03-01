@@ -82,7 +82,7 @@ def sleep_phase(model, tokenizer, device, config, lifetime_elite_mask, prototype
     # ==========================================
     # 阶段 2：REM (快速眼动) - 虚拟满血复活与微调
     # ==========================================
-    if not config.get('use_rem', True) or num_classes == 0:
+    if config.get('no_rem', False) or num_classes == 0:
         # 🚨 已经删除了此处的清零代码
         return model, global_masks
 

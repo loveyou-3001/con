@@ -74,7 +74,10 @@ class HOPTrainer:
             with torch.no_grad():
                 for name, param in self.trainable_params_cache:
                     if param.grad is not None:
-                        self.task_importance[name] = 0.9 * self.task_importance[name] + 0.1 * param.grad.abs()
+                        # ✅ [问题8修复] 累加求和替代 EMA，所有批次梯度等权重
+                        # 旧 EMA (0.9*old + 0.1*new)：第1批权重=0.9^(N-1)→0，精英只由最后几批决定
+                        # 新累加：task_importance = Σ|∂L/∂θ|，等价于 Taylor 重要性，学术标准做法
+                        self.task_importance[name] += param.grad.abs()
 
             # 🌟 [Optimization] SVD 正交梯度投影 (Orthogonal Gradient Projection) 🌟
             with torch.no_grad():
@@ -93,7 +96,35 @@ class HOPTrainer:
                             mask = previous_mask[name]
                             param.grad *= (1.0 - mask)
 
+            # ✅ [Adam 泄漏修复] 后处理参数投影 (Post-Step Weight Projection)
+            # 根因：Adam 的分母 1/√v_t 对动量逐元素缩放，破坏其在零空间内的方向
+            #   设 x ∈ Null(P)，但 x_i / √v_i 逐元素除以不同数后，结果一般已不在 Null(P)
+            # 修复：Step 前快照旧权重，Step 后将实际位移 Δ = W_new - W_old 投影回零空间
+            #   W_corrected = W_old + P(Δ)，保证参数实际变化量绝对不侵入旧知识方向
+            # 注：Adam 动量（分子）因线性性质对零空间是安全的，只有分母需要此修复
+            has_svd = hasattr(self, 'orthogonal_bases') and bool(self.orthogonal_bases)
+            if has_svd:
+                # 只克隆有正交基的参数，跳过无需投影的参数，避免不必要的显存分配
+                old_weights = {name: param.data.clone()
+                               for name, param in self.trainable_params_cache
+                               if name in self.orthogonal_bases}
+
             optimizer.step()
+
+            if has_svd:
+                with torch.no_grad():
+                    for name, param in self.trainable_params_cache:
+                        if name in self.orthogonal_bases:
+                            P = self.orthogonal_bases[name]
+                            # 1. 提取 Adam 实际走出的扭曲位移（含分母缩放的歪斜）
+                            delta = param.data - old_weights[name]
+                            delta_2d = delta.view(param.shape[0], -1).float()
+                            # 2. 强行将位移拉回完美的正交零空间
+                            proj_delta = torch.mm(delta_2d, P)
+                            # 3. 用「旧权重 + 零空间位移」替换 Adam 的扭曲结果
+                            corrected = old_weights[name].view(param.shape[0], -1).float() + proj_delta
+                            param.data.copy_(corrected.view_as(param.data))
+
             
             pbar.set_postfix({'Loss': f"{total_loss_val.item():.3f}"})
 
