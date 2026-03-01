@@ -27,10 +27,42 @@ def sleep_phase(model, tokenizer, device, config, importance_matrix, prototype_m
                 global_masks[name] = torch.ones_like(param)
                 continue
 
-            # ✅ [方案X] LoRA 参数取消无差别豆免，走重要性分位数筛选流程
-            # 旧代码用 global_masks = ones * (1 - 0.01) = 0.99 全员保护
-            # 导致仅两个任务后即锁死 88%+ 空间，后续任务无法学习
-            # 现在：LoRA 和普通层一样，只保护重要性 > 85th 百分位数的神经元
+            # ✅ [方案X] LoRA 精英提纯 + 终身记忆稀疏化
+            # 核心设计：Top-15% 精英突触保留软保护，底部 85% 的终身记忆强制清零
+            # 这解决了 lora_B [out_dim, 16] 的真实死局：
+            #   16 维投影空间在多任务后被逐渐填满，零空间 = 16 - k → 趋近 0
+            # 稀疏化后，SVD 的奇异值能量重新集中，k 值下降，零空间得以释放
+            if 'lora' in name:
+                soft_alpha = config.get('lora_alpha', 0.01)
+
+                if name in importance_matrix:
+                    imp = importance_matrix[name]
+
+                    # 1. 画红线：只保留排名前 15% 的精英突触
+                    threshold = torch.quantile(imp.float(), 0.85)
+                    elite_mask = (imp > threshold).float()
+
+                    # 2. 🚨 稀疏化终身记忆：将底部 85% 的历史记录强制归零
+                    # 效果：下一任务的 SVD 看到的是"精华版"终身记忆，
+                    # 奇异值能量更集中 → k 值更小 → 零空间更大 → Task N+1 可以学习
+                    # 代价：底部 85% 边缘神经元失去正交保护（可接受的工程权衡）
+                    importance_matrix[name] = imp * elite_mask
+
+                    # 3. 基于精英化后的重要性计算归一化衰减
+                    pruned_imp = importance_matrix[name]
+                    lora_imp_norm = pruned_imp / (pruned_imp.max() + 1e-8) \
+                        if pruned_imp.max() > 0 else torch.zeros_like(param)
+                else:
+                    lora_imp_norm = torch.zeros_like(param)
+                    elite_mask = torch.zeros_like(param)
+
+                # 4. 物理压缩：使用极小的 soft_alpha（0.01），温柔保护精英突触
+                decay = 1.0 - soft_alpha * (1.0 - lora_imp_norm)
+                param.data *= decay
+
+                # 5. 只给精英 15% 加上软保护掩码（0.99），非精英掩码为 0
+                global_masks[name] = elite_mask * (1.0 - soft_alpha)
+                continue
 
             # 常规参数重要性获取
             if name in importance_matrix:
