@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import gc
-from tqdm import tqdm
-from sklearn.metrics import accuracy_score
-from src.sleep import synaptic_downscaling # 确保与修复后的函数名一致
+import copy
+from tqdm import tqdm  
+from src.sleep import sleep_phase
 
 class HOPTrainer:
     def __init__(self, model, device, args):
@@ -12,27 +12,25 @@ class HOPTrainer:
         self.args = args
         self.criterion = nn.CrossEntropyLoss()
         
-        # 1. 重要性矩阵 (Hebbian Trace) 初始化
-        self.importance_matrix = {}
-        
-        # 2. [Optimization] 预先缓存可训练参数，提升大循环效率
+        self.importance_matrix = {}    # 当前任务实时积累器（每次新任务前清零）
+        self.lifetime_importance = {}    # 终身记忆：跨所有任务的最大重要性总图
         self.trainable_params_cache = []
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                # 初始重要性为极小值而非纯零，防止除零错误
-                self.importance_matrix[name] = torch.full_like(param.data, 1e-8)
+                self.importance_matrix[name] = torch.zeros_like(param.data)
+                self.lifetime_importance[name] = torch.zeros_like(param.data)
                 self.trainable_params_cache.append((name, param))
 
-    def train_epoch(self, loader, prototype_memory, previous_mask, optimizer, epoch_idx=0):
+    def train_epoch(self, loader, prototype_memory, previous_mask, optimizer, frozen_model=None, epoch_idx=0):
         self.model.train()
         total_loss = 0
         valid_batches = 0
-        
-        # 读取回放强度
-        proto_lambda = getattr(self.args, 'proto_lambda', 2.0)
 
-        # 进度条配置
-        pbar = tqdm(loader, desc=f"   Epoch {epoch_idx+1}/{self.args.epochs}", leave=False)
+        # 现在我们有了正交投影，蒸馏系数可以恢复到温和的 1.0
+        proto_lambda = getattr(self.args, 'proto_lambda', 1.0)
+        distill_lambda = getattr(self.args, 'distill_lambda', 1.0)
+
+        pbar = tqdm(loader, desc=f"  Epoch {epoch_idx+1}/{self.args.epochs}", leave=False)
 
         for batch in pbar:
             input_ids = batch['input_ids'].to(self.device)
@@ -41,143 +39,194 @@ class HOPTrainer:
             
             optimizer.zero_grad()
             
-            # --- Stream A: 新任务学习 (Wake Phase) ---
-            logits = self.model(input_ids, attention_mask)
-            loss_main = self.criterion(logits, labels)
+            # --- Stream A: 显意识学习 ---
+            student_logits = self.model(input_ids, attention_mask)
+            loss_main = self.criterion(student_logits, labels)
             
-            # --- Stream B: 旧知识原型回放 (Wake Replay) ---
+            # --- Stream B: 梦境回放 ---
             loss_proto = torch.tensor(0.0, device=self.device)
             if prototype_memory is not None and len(prototype_memory.prototypes) > 0:
-                # 加上 self. 前缀
-                proto_feats, proto_labels = prototype_memory.get_prototype_batch(batch_size=self.args.batch_size // 2)
-                
+                proto_feats, proto_labels = prototype_memory.get_prototype_batch(batch_size=16)
                 if proto_feats is not None:
-                    # 直接喂给分类器，绕过 BERT/LoRA，速度提升千倍
-                    proto_logits = self.model.classifier(proto_feats.to(self.device))
-                    loss_proto = self.criterion(proto_logits, proto_labels.to(self.device)) * proto_lambda
+                    proto_feats = proto_feats.to(self.device)
+                    proto_labels = proto_labels.to(self.device)
+                    if isinstance(self.model.classifier, nn.Sequential):
+                        proto_logits = self.model.classifier(proto_feats)
+                    else:
+                        proto_logits = self.model.classifier(proto_feats)
+                        
+                    loss_proto = self.criterion(proto_logits, proto_labels) * proto_lambda
 
-            # 总 Loss 计算
-            total_loss_val = loss_main + loss_proto
+            # --- Stream C: 潜意识蒸馏 (提供软性直觉引导) ---
+            loss_distill = torch.tensor(0.0, device=self.device)
+            if frozen_model is not None:
+                with torch.no_grad():
+                    frozen_logits = frozen_model(input_ids, attention_mask)
+                loss_distill = nn.MSELoss()(student_logits, frozen_logits) * distill_lambda
+
+            total_loss_val = loss_main + loss_proto + loss_distill
             total_loss_val.backward()
             
-            # --- 核心机制 1: Hebbian 重要性累积 ---
-            # 公式: $I_t = \gamma I_{t-1} + (1-\gamma) |Grad|$
+            total_loss += total_loss_val.item()
+            valid_batches += 1
+
+            # [Optimization] Hebbian Accumulation
             with torch.no_grad():
                 for name, param in self.trainable_params_cache:
                     if param.grad is not None:
                         self.importance_matrix[name] = 0.9 * self.importance_matrix[name] + 0.1 * param.grad.abs()
 
-            # --- 核心机制 2: 梯度屏蔽 (Gradient Masking) ---
-            # 阻止梯度修改已被 Sleep 保护的旧知识神经元
-            if previous_mask is not None:
+            # 🌟 [Optimization] SVD 正交梯度投影 (Orthogonal Gradient Projection) 🌟
+            with torch.no_grad():
                 for name, param in self.trainable_params_cache:
-                    if param.grad is not None and name in previous_mask:
-                        mask = previous_mask[name].to(self.device)
-                        param.grad *= (1.0 - mask)
+                    if param.grad is not None:
+                        # 1. 针对 2D 参数矩阵 (LoRA, Classifier) 的高阶正交投影
+                        if hasattr(self, 'orthogonal_bases') and name in self.orthogonal_bases:
+                            P = self.orthogonal_bases[name]
+                            grad_2d = param.grad.view(param.shape[0], -1).float()
+                            # 矩阵乘法：强制抹除梯度在旧知识特征空间上的所有分量
+                            proj_grad = torch.mm(grad_2d, P)
+                            param.grad.copy_(proj_grad.view_as(param.grad))
+                            
+                        # 2. 针对 1D 参数 (如 Bias) 的降级元素掩码保护
+                        elif previous_mask is not None and name in previous_mask:
+                            mask = previous_mask[name]
+                            param.grad *= (1.0 - mask)
 
             optimizer.step()
             
-            total_loss += total_loss_val.item()
-            valid_batches += 1
-            pbar.set_postfix({'loss': f"{total_loss_val.item():.4f}"})
-            
-        return total_loss / valid_batches if valid_batches > 0 else 0
+            pbar.set_postfix({'Loss': f"{total_loss_val.item():.3f}"})
 
     def train_task(self, loader, prototype_memory, previous_mask):
-        """执行单个任务的完整训练循环"""
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()), 
             lr=self.args.lr, 
-            weight_decay=0.01 
+            weight_decay=0.0 
         )
         
-        # 任务开始前，衰减旧任务的重要性权重，为新知识腾挪注意力
+        # ✅ [方案A] 只清零当前任务积累器，不触动终身记忆
+        # 旧代码 *= 0.1 会让 Task 0 的印记在 Task 2 后衰减至 1%，导致 SVD 遗忘
         for k in self.importance_matrix:
-            self.importance_matrix[k] *= 0.1 
+            self.importance_matrix[k].zero_()
 
-        print(f"☀️ [Trainer] 启动任务训练 (Wake Phase)...")
+        frozen_model = None
+        self.orthogonal_bases = {} # 初始化正交矩阵字典
+        
+        if previous_mask is not None:
+            print("🧠 [Distillation] 捕捉当前脑部快照，作为学习新任务的'潜意识模板'...")
+            frozen_model = copy.deepcopy(self.model)
+            frozen_model.eval()
+            for param in frozen_model.parameters():
+                param.requires_grad = False
+                
+            # 🌟 核心引擎：计算 Hebbian-SVD 投影矩阵
+            print("📐 [Orthogonal] 计算 Hebbian-SVD 梯度正交投影矩阵 (保护核心特征子空间)...")
+            for name, param in self.model.named_parameters():
+                # 只对 2D 以上的矩阵进行 SVD 分解
+                # ✅ [方案A] 使用 lifetime_importance（终身记忆），而非会衰减的当前积累器
+                if param.requires_grad and param.dim() > 1 and name in self.lifetime_importance:
+                    imp_mat = self.lifetime_importance[name].view(param.shape[0], -1).float()
+                    
+                    if imp_mat.sum() == 0:
+                        continue
+                        
+                    try:
+                        # 奇异值分解
+                        U, S, Vh = torch.linalg.svd(imp_mat, full_matrices=False)
+                        
+                        # 截断策略：提取包含 90% 能量的主成分方向
+                        total_energy = (S ** 2).sum()
+                        current_energy = 0
+                        k = 0
+                        for i in range(len(S)):
+                            current_energy += S[i] ** 2
+                            if current_energy / total_energy > 0.90:
+                                k = i + 1
+                                break
+                                
+                        if k > 0:
+                            V_k = Vh[:k, :].T  # [in_dim, k]
+                            # P = I - V * V^T (构建正交零空间)
+                            I = torch.eye(imp_mat.shape[1], device=self.device)
+                            P = I - torch.mm(V_k, V_k.T)
+                            self.orthogonal_bases[name] = P
+                    except RuntimeError as e:
+                        # 防止 SVD 在极端情况下不收敛
+                        print(f"   ⚠️ SVD failed for {name}, fallback to default masking.")
+                        pass
+
+        print(f"🚀 [Trainer] Start waking training phase for {self.args.epochs} epochs...")
+        
         for epoch in range(self.args.epochs):
-            avg_loss = self.train_epoch(loader, prototype_memory, previous_mask, optimizer, epoch_idx=epoch)
-            if (epoch + 1) % 5 == 0:
-                print(f"   > Epoch {epoch+1} Avg Loss: {avg_loss:.4f}")
+            self.train_epoch(
+                loader, 
+                prototype_memory, 
+                previous_mask, 
+                optimizer, 
+                frozen_model=frozen_model,
+                epoch_idx=epoch
+            )
+        
+        # ✅ [方案A] 训练结束后，将当前任务的重要性用 max 合并进终身记忆
+        # max 合并保证：任何任务中最重要的神经元永远不会在后续 SVD 中被遗忘
+        print("📚 [Lifetime Memory] 合并当前任务重要性到终身记忆 (max-union)...")
+        with torch.no_grad():
+            for k in self.importance_matrix:
+                if k in self.lifetime_importance:
+                    self.lifetime_importance[k] = torch.max(
+                        self.lifetime_importance[k],
+                        self.importance_matrix[k]
+                    )
             
         torch.cuda.empty_cache()
         gc.collect()
 
     def sleep(self, tokenizer, current_mask, prototype_memory):
-        """
-        调用核心睡眠机制：
-        1. NREM 执行物理压缩与容量回收
-        2. REM 执行梦境复习与边界修复
-        """
-        if not getattr(self.args, 'use_sleep', False):
+        if not self.args.use_sleep:
             return self.model, current_mask
             
-        print(f"💤 [Trainer] 任务训练结束，触发睡眠巩固 (NREM + REM)...")
+        print(f"💤 [Trainer] Training done. Initiating Sleep Phase (Consolidation)...")
         
-        # 包装消融实验配置
         config = {
             'alpha': self.args.alpha,
             'target_norm': self.args.target_norm,
-            'use_rem': not getattr(self.args, 'no_rem', False),
+            'no_rem': getattr(self.args, 'no_rem', False),
             'lora_alpha': getattr(self.args, 'lora_alpha', 0.01),
         }
         
-        # 执行物理级压缩
-        new_mask = synaptic_downscaling(
+        self.model, new_mask = sleep_phase(
             self.model, 
-            self.importance_matrix, 
-            current_mask, 
+            tokenizer, 
+            self.device, 
             config, 
+            self.lifetime_importance,   # ✅ [方案A] 使用终身记忆，让 sleep 阶段也感知所有历史任务的重要性
             prototype_memory,
-            self.device
+            previous_mask=current_mask 
         )
         
-        # --- 掩码合并逻辑 (Union of Protection) ---
         if new_mask is not None:
             if current_mask is None:
                 current_mask = new_mask
             else:
                 for k, v in new_mask.items():
-                    # 只要该位置被保护过，就终身保护
-                    current_mask[k] = torch.max(current_mask[k], v.to(current_mask[k].device))
+                    current_mask[k] = v 
             
-            # 打印容量健康统计
-            self._log_capacity_stats(current_mask)
+            total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            if total_params > 0:
+                locked_params = sum(m.sum().item() for m in current_mask.values())
+                print(f"🛡️  [Memory Capacity] Total Protected Neurons: {locked_params/total_params*100:.2f}%")
             
         return self.model, current_mask
 
-    def _log_capacity_stats(self, mask_dict):
-        """分析并打印模型容量占用情况"""
-        total_p = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        locked_p = sum(m.sum().item() for m in mask_dict.values())
-        
-        # 统计压缩率 (分类器中模长接近 0 的参数)
-        with torch.no_grad():
-            low_norm_p = 0
-            cls_total = 0
-            for name, param in self.model.classifier.named_parameters():
-                if 'weight' in name:
-                    low_norm_p += (param.data.abs() < 1e-3).sum().item()
-                    cls_total += param.numel()
-
-        print(f"🛡️  [Capacity] 保护神经元占比: {locked_p/total_p*100:.2f}%")
-        if cls_total > 0:
-            print(f"📉 [NREM] 分类器冗余压缩率: {low_norm_p/cls_total*100:.2f}%")
-
     def evaluate(self, loader):
-        """标准的评估逻辑"""
         self.model.eval()
-        all_preds, all_gts = [], []
+        preds, gts = [], []
         
         with torch.no_grad():
             for batch in loader:
-                input_ids = batch['input_ids'].to(self.device)
-                mask = batch['attention_mask'].to(self.device)
-                labels = batch['labels'].to(self.device)
+                logits = self.model(batch['input_ids'].to(self.device), batch['attention_mask'].to(self.device))
+                preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+                gts.extend(batch['labels'].cpu().numpy())
                 
-                logits = self.model(input_ids, mask)
-                all_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
-                all_gts.extend(labels.cpu().numpy())
-                
-        return accuracy_score(all_gts, all_preds)
+        from sklearn.metrics import accuracy_score
+        return accuracy_score(gts, preds)

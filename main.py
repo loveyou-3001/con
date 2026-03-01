@@ -46,7 +46,8 @@ def parse_args():
     # --- 消融实验专用开关 ---
     parser.add_argument("--no_rem", action="store_true", help="[Ablation A3] 跳过 REM 梦境修复")
     parser.add_argument("--lora_alpha", type=float, default=0.01, help="[Ablation A4] LoRA 软豁免强度")
-    parser.add_argument("--no_cosine", action="store_true", help="[Ablation A1] 禁用 CosineLinear")    
+    parser.add_argument("--no_cosine", action="store_true", help="[Ablation A1] 禁用 CosineLinear")
+    parser.add_argument('--distill_lambda', type=float, default=2.0, help='潜意识蒸馏(Subconscious Distillation)的Loss权重')    
     
     return parser.parse_args()
 
