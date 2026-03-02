@@ -4,7 +4,6 @@ import torch
 import numpy as np
 import json
 import random
-import copy
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from peft import PeftModel
@@ -35,19 +34,20 @@ def parse_args():
     parser.add_argument("--hop_order", type=int, default=1)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank (16/32/64)")
     parser.add_argument("--use_sleep", action="store_true", help="是否启用睡眠机制")
     
     # --- Sleep & Mechanism 核心参数 ---
     parser.add_argument("--target_norm", type=float, default=11.5, help="NREM 权重天花板")
-    parser.add_argument("--alpha", type=float, default=0.5, help="NREM 压缩强度")
-    parser.add_argument("--proto_lambda", type=float, default=2.0, help="Wake 阶段原型回放强度")
-    
+    parser.add_argument("--alpha", type=float, default=0.5, help="NREM 压缩强度 (0.2~0.5)")
+    parser.add_argument("--elite_quantile", type=float, default=0.85, help="精英提纯分位数 (0.90=Top10%%, 0.85=Top15%%)")
+    parser.add_argument("--lora_elite_quantile", type=float, default=None, help="LoRA 专属精英分位数，不设则与 elite_quantile 相同。提高此值可增强特征空间稳定性 (如 0.95=Top5%%)")
+    parser.add_argument("--num_centroids", type=int, default=1, help="原型簇数 (1=单高斯)")
     # --- 消融实验专用开关 ---
     parser.add_argument("--no_rem", action="store_true", help="[Ablation A3] 跳过 REM 梦境修复")
     parser.add_argument("--lora_alpha", type=float, default=0.01, help="[Ablation A4] LoRA 软豁免强度")
     parser.add_argument("--no_cosine", action="store_true", help="[Ablation A1] 禁用 CosineLinear")
-    parser.add_argument('--distill_lambda', type=float, default=2.0, help='潜意识蒸馏(Subconscious Distillation)的Loss权重')    
     
     return parser.parse_args()
 
@@ -72,10 +72,11 @@ def main():
         num_classes=args.num_classes, 
         hop_order=args.hop_order, 
         use_lora=True,
-        use_cosine=not args.no_cosine
+        use_cosine=not args.no_cosine,
+        lora_rank=args.lora_rank
     ).to(device)
 
-    prototype_memory = PrototypeMemory(args.num_classes, 768, device)
+    prototype_memory = PrototypeMemory(args.num_classes, 768, device, num_centroids=args.num_centroids)
     trainer = HOPTrainer(model, device, args) 
 
     R = np.zeros((args.num_tasks, args.num_tasks))
@@ -96,7 +97,7 @@ def main():
         
         # --- B. 清醒学习 (Wake Phase) ---
         print(f"☀️ [Wake] 正在训练新任务...")
-        trainer.train_task(train_loader, prototype_memory, current_mask)
+        trainer.train_task(train_loader)
         
         # 提前构建原型加载器（Sleep 内部 NREM 后刷新 + Sleep 后最终更新 都需要它）
         prototype_loader = DataLoader(train_dataset, batch_size=32, shuffle=False)

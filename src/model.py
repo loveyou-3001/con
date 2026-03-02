@@ -74,19 +74,19 @@ class CosineLinear(nn.Module):
         return self.sigma * cosine_sim
 
 class HOPBertClassifier(nn.Module):
-    def __init__(self, bert_path, num_classes, hop_order=2, use_lora=True, use_cosine=True):
+    def __init__(self, bert_path, num_classes, hop_order=2, use_lora=True, use_cosine=True, lora_rank=16):
         super(HOPBertClassifier, self).__init__()
         print(f"🏗️ Loading BERT from: {bert_path}")
         self.config = AutoConfig.from_pretrained(bert_path)
         self.bert = AutoModel.from_pretrained(bert_path, config=self.config)
         
         if use_lora:
-            print("✨ Applying LoRA (Low-Rank Adaptation)...")
+            print(f"✨ Applying LoRA (rank={lora_rank})...")
             peft_config = LoraConfig(
                 task_type=TaskType.FEATURE_EXTRACTION, 
                 inference_mode=False, 
-                r=16,           # Rank 提升至 16，增强新任务的学习容量
-                lora_alpha=32, 
+                r=lora_rank,
+                lora_alpha=lora_rank * 2,
                 lora_dropout=0.1
             )
             self.bert = get_peft_model(self.bert, peft_config)
