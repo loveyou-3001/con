@@ -108,13 +108,6 @@ def main():
             model, current_mask = trainer.sleep(tokenizer, current_mask, prototype_memory,
                                                 prototype_loader=prototype_loader)
 
-        # --- C. 记忆巩固 (Update Prototypes) ---
-        # ✅ [坐标系修复] 移至 Sleep 之后：原型与 post-NREM+REM 特征空间对齐
-        # 旧（Sleep 前）：原型在 pre-NREM 坐标系 → 下一轮 REM 使用过时原型 → 分布不匹配
-        # 新（Sleep 后）：原型在 post-Sleep 坐标系 → 下一轮 REM 使用最新坐标 → 准确边界
-        print("🧠 [Hippocampus] 正在更新高斯原型记忆 (post-sleep 坐标系对齐)...")
-        prototype_memory.update_prototypes(model, prototype_loader, device)
-        
         # --- E. 保存进度 (Checkpoints) ---
         task_ckpt_dir = os.path.join(output_dir, f"task_{task_id}")
         os.makedirs(task_ckpt_dir, exist_ok=True)
@@ -124,27 +117,39 @@ def main():
         
         # --- F. 评估所有已学任务 (Evaluate All Learned Tasks) ---
         print(f"🧐 正在评估历史任务性能 (Task 0 -> {task_id})...")
-        accs = []
-        model.eval() # 切换到评估模式
+        test_accs = []
+        train_accs = []
+        model.eval()
         
         with torch.no_grad():
             for eval_id in range(task_id + 1):
-                test_path = os.path.join(args.data_root, f"task_{eval_id}", "test.json")
+                test_path  = os.path.join(args.data_root, f"task_{eval_id}", "test.json")
+                train_path = os.path.join(args.data_root, f"task_{eval_id}", "train.json")
+
                 if not os.path.exists(test_path):
-                    accs.append(0.0)
+                    test_accs.append(0.0)
+                    train_accs.append(0.0)
                     continue
                 
-                test_loader = DataLoader(JSONLDataset(test_path, tokenizer), batch_size=64)
-                # 🌟 优化：直接使用内存中的模型进行评估，避免重复加载导致的显存溢出
-                acc = trainer.evaluate(test_loader)
-                accs.append(acc)
-                R[task_id, eval_id] = acc
+                test_loader  = DataLoader(JSONLDataset(test_path, tokenizer), batch_size=64)
+                acc_test = trainer.evaluate(test_loader)
+                test_accs.append(acc_test)
+                R[task_id, eval_id] = acc_test
+
+                if os.path.exists(train_path):
+                    train_loader_eval = DataLoader(JSONLDataset(train_path, tokenizer), batch_size=64)
+                    acc_train = trainer.evaluate(train_loader_eval)
+                    train_accs.append(acc_train)
+                else:
+                    train_accs.append(0.0)
         
-        # 实时打印成绩单
-        avg_acc = np.mean(accs) * 100
+        avg_test  = np.mean(test_accs) * 100
+        avg_train = np.mean(train_accs) * 100
         print(f"📊 Task {task_id} 完结成绩单:")
-        print(f"   > Average Accuracy: {avg_acc:.2f}%")
-        print(f"   > Current Acc List: {[f'{x*100:.1f}' for x in accs]}")
+        print(f"   > Test  Average: {avg_test:.2f}%")
+        print(f"   > Test  Acc List: {[f'{x*100:.1f}' for x in test_accs]}")
+        print(f"   > Train Average: {avg_train:.2f}%")
+        print(f"   > Train Acc List: {[f'{x*100:.1f}' for x in train_accs]}")
 
     # 4. 最终结算
     if args.num_tasks > 0:
