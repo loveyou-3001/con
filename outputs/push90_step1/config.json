@@ -1,0 +1,21 @@
+{
+    "exp_name": "push90_step1",
+    "data_root": "data/clinc150",
+    "model_id": "bert-base-uncased",
+    "seed": 123,
+    "num_tasks": 15,
+    "num_classes": 150,
+    "lr": 0.0001,
+    "epochs": 20,
+    "batch_size": 32,
+    "lora_rank": 16,
+    "use_sleep": true,
+    "target_norm": 11.5,
+    "alpha": 0.5,
+    "elite_quantile": 0.85,
+    "lora_elite_quantile": null,
+    "num_centroids": 1,
+    "no_rem": false,
+    "lora_alpha": 0.01,
+    "no_cosine": false
+}

@@ -6,7 +6,6 @@ import json
 import random
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-from peft import PeftModel
 
 # 引入模块
 from src.model import HOPBertClassifier, get_bert_path
@@ -31,12 +30,13 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_tasks", type=int, default=15)
     parser.add_argument("--num_classes", type=int, default=150)
-    parser.add_argument("--hop_order", type=int, default=1)
+
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lora_rank", type=int, default=16, help="LoRA rank (16/32/64)")
     parser.add_argument("--use_sleep", action="store_true", help="是否启用睡眠机制")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay (0.01=抗过拟合)")
     
     # --- Sleep & Mechanism 核心参数 ---
     parser.add_argument("--target_norm", type=float, default=11.5, help="NREM 权重天花板")
@@ -57,7 +57,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # 1. 环境准备
-    output_dir = os.path.join("output", args.exp_name)
+    output_dir = os.path.join("outputs", args.exp_name)
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(vars(args), f, indent=4)
@@ -70,7 +70,6 @@ def main():
     model = HOPBertClassifier(
         model_path, 
         num_classes=args.num_classes, 
-        hop_order=args.hop_order, 
         use_lora=True,
         use_cosine=not args.no_cosine,
         lora_rank=args.lora_rank
@@ -124,7 +123,7 @@ def main():
         with torch.no_grad():
             for eval_id in range(task_id + 1):
                 test_path  = os.path.join(args.data_root, f"task_{eval_id}", "test.json")
-                train_path = os.path.join(args.data_root, f"task_{eval_id}", "train.json")
+                eval_train_path = os.path.join(args.data_root, f"task_{eval_id}", "train.json")
 
                 if not os.path.exists(test_path):
                     test_accs.append(0.0)
@@ -136,8 +135,8 @@ def main():
                 test_accs.append(acc_test)
                 R[task_id, eval_id] = acc_test
 
-                if os.path.exists(train_path):
-                    train_loader_eval = DataLoader(JSONLDataset(train_path, tokenizer), batch_size=64)
+                if os.path.exists(eval_train_path):
+                    train_loader_eval = DataLoader(JSONLDataset(eval_train_path, tokenizer), batch_size=64)
                     acc_train = trainer.evaluate(train_loader_eval)
                     train_accs.append(acc_train)
                 else:

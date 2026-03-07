@@ -74,7 +74,7 @@ class CosineLinear(nn.Module):
         return self.sigma * cosine_sim
 
 class HOPBertClassifier(nn.Module):
-    def __init__(self, bert_path, num_classes, hop_order=2, use_lora=True, use_cosine=True, lora_rank=16):
+    def __init__(self, bert_path, num_classes, use_lora=True, use_cosine=True, lora_rank=16):
         super(HOPBertClassifier, self).__init__()
         print(f"🏗️ Loading BERT from: {bert_path}")
         self.config = AutoConfig.from_pretrained(bert_path)

@@ -59,6 +59,12 @@ class HOPTrainer:
                     if param.grad is not None and name in self.lifetime_elite_mask:
                         param.grad *= (1.0 - self.lifetime_elite_mask[name].to(param.device))
 
+            # ✅ [Gradient Clipping] 防止大梯度破坏共享权重中的旧知识
+            nn.utils.clip_grad_norm_(
+                [p for _, p in self.trainable_params_cache if p.grad is not None],
+                max_norm=1.0
+            )
+
             # ✅ [Adam 泄漏修复] Pre-Step 快照 → Post-Step 精英位置强制还原
             # 根因：即使梯度清零，Adam 内已积累的历史动量 m_t 仍会施加残余位移
             # 修复：Step 前克隆精英权重，Step 后将精英位置强制还原为快照值
@@ -66,7 +72,7 @@ class HOPTrainer:
                 elite_snapshot = {
                     name: param.data.clone()
                     for name, param in self.trainable_params_cache
-                    if name in self.lifetime_elite_mask
+                    if name in self.lifetime_elite_mask and self.lifetime_elite_mask[name].any()
                 }
 
             optimizer.step()
@@ -86,7 +92,7 @@ class HOPTrainer:
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()),
             lr=self.args.lr,
-            weight_decay=0.0
+            weight_decay=getattr(self.args, 'weight_decay', 0.01)
         )
 
         # ✅ [双字典] 只清零当前任务积累器，终身精英掩码绝不触动
@@ -177,11 +183,12 @@ class HOPTrainer:
                     lora_B_weight.zero_()
                     merged_count += 1
 
-        # 清除 LoRA 的精英掩码（旧 LoRA 已合并入主干，掩码失去意义）
-        # 分类器精英掩码保留不动
-        for name in self.lifetime_elite_mask:
-            if 'lora' in name:
-                self.lifetime_elite_mask[name].zero_()
+        # 🔧 [Fix A] 保留 LoRA 精英掩码，不再清零
+        # 原因：清零后新任务 LoRA 完全无约束，导致特征空间漂移和遗忘
+        # 保留掩码可以锁定精英位置在零，限制新 LoRA 自由度
+        # for name in self.lifetime_elite_mask:
+        #     if 'lora' in name:
+        #         self.lifetime_elite_mask[name].zero_()
 
         print(f"   🧬 [Consolidation] {merged_count} 个 LoRA 层已合并入主干并重置为零")
 
