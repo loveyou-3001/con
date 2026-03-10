@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import gc
@@ -178,8 +179,8 @@ class HOPTrainer:
                     # 合并：W_base += B @ A * scaling
                     base_weight.data += (lora_B_weight @ lora_A_weight) * scaling
 
-                    # 重置 LoRA 为零（突触归零，准备学新知识）
-                    lora_A_weight.zero_()
+                    # 重置 LoRA：A 使用 Kaiming 初始化打破对称性，B 设为零保证合并等效
+                    nn.init.kaiming_uniform_(lora_A_weight, a=math.sqrt(5))
                     lora_B_weight.zero_()
                     merged_count += 1
 
